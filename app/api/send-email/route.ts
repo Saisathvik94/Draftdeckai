@@ -1,20 +1,157 @@
-import { NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import nodemailer from 'nodemailer';
+import { z } from 'zod';
+import { emailSchema, sanitizeHtml, sanitizeInput } from '@/lib/validation';
+import { createRoute } from '@/lib/supabase/server';
+import { createClient } from '@supabase/supabase-js';
+import { logSecurityEvent } from '@/lib/security';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const { to, subject, content, fromName, fromEmail, letterContent } = body;
+// Rate limiting store: 5 requests per 15 minutes per user ID
+const rateLimitStore = new Map<string, { count: number; reset: number }>();
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const MAX_REQUESTS_PER_WINDOW = 5;
 
-    if (!to || !subject || !letterContent) {
-      return NextResponse.json(
-        { error: 'Missing required fields' },
-        { status: 400 }
+function checkRateLimit(userId: string): { allowed: boolean; remaining: number; reset: number } {
+  const now = Date.now();
+  let data = rateLimitStore.get(userId);
+
+  if (!data || now > data.reset) {
+    data = { count: 1, reset: now + RATE_LIMIT_WINDOW_MS };
+    rateLimitStore.set(userId, data);
+    return { allowed: true, remaining: MAX_REQUESTS_PER_WINDOW - 1, reset: data.reset };
+  }
+
+  if (data.count >= MAX_REQUESTS_PER_WINDOW) {
+    return { allowed: false, remaining: 0, reset: data.reset };
+  }
+
+  data.count++;
+  rateLimitStore.set(userId, data);
+  return { allowed: true, remaining: MAX_REQUESTS_PER_WINDOW - data.count, reset: data.reset };
+}
+
+const sendEmailSchema = z.object({
+  to: emailSchema,
+  subject: z.string().min(1, 'Subject is required').max(200, 'Subject is too long'),
+  content: z.string().max(5000, 'Content is too long').optional().nullable(),
+  fromName: z.string().max(100, 'From name is too long').optional().nullable(),
+  fromEmail: z.string().max(254, 'From email is too long').refine((val: string) => {
+    if (!val) return true;
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val);
+  }, 'Invalid from email').optional().nullable(),
+  letterContent: z.object({
+    from: z.object({
+      name: z.string().max(100).optional().nullable(),
+      address: z.string().max(200).optional().nullable(),
+    }).optional().nullable(),
+    to: z.object({
+      name: z.string().max(100).optional().nullable(),
+      address: z.string().max(200).optional().nullable(),
+    }).optional().nullable(),
+    date: z.string().max(100).optional().nullable(),
+    subject: z.string().max(200).optional().nullable(),
+    content: z.string().max(10000, 'Letter content is too long').optional().nullable(),
+  }),
+});
+
+export async function POST(request: NextRequest) {
+  const ip = request.ip || request.headers.get('x-forwarded-for') || 'unknown';
+
+  try {
+    // 1. Authentication Verification
+    const authHeader = request.headers.get('authorization');
+    const token = authHeader?.replace('Bearer ', '');
+
+    let supabase;
+    if (token) {
+      supabase = createClient(
+        process.env.NEXT_PUBLIC_SUPABASE_URL!,
+        process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+        {
+          global: {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          },
+        }
+      );
+    } else {
+      supabase = await createRoute();
+    }
+
+    const { data: { user }, error: authError } = await supabase.auth.getUser();
+
+    if (authError || !user) {
+      logSecurityEvent('UNAUTHORIZED_EMAIL_ATTEMPT', { authError, ip }, ip);
+      return new Response(
+        JSON.stringify({ error: 'Unauthorized - Please sign in to send emails' }),
+        { status: 401, headers: { 'Content-Type': 'application/json' } }
       );
     }
+
+    // 2. Rate Limiting Check
+    const rateLimitResult = checkRateLimit(user.id);
+    if (!rateLimitResult.allowed) {
+      logSecurityEvent('RATE_LIMIT_EXCEEDED_EMAIL', { userId: user.id, ip }, ip);
+      return new Response(
+        JSON.stringify({ 
+          error: 'Rate limit exceeded. Maximum 5 emails allowed per 15 minutes.',
+          retryAfter: Math.ceil((rateLimitResult.reset - Date.now()) / 1000)
+        }),
+        { 
+          status: 429,
+          headers: {
+            'Content-Type': 'application/json',
+            'Retry-After': Math.ceil((rateLimitResult.reset - Date.now()) / 1000).toString(),
+          }
+        }
+      );
+    }
+
+    // 3. Request Body Parsing & Validation
+    let rawBody;
+    try {
+      rawBody = await request.json();
+    } catch {
+      return new Response(
+        JSON.stringify({ error: 'Invalid JSON payload' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const validationResult = sendEmailSchema.safeParse(rawBody);
+    if (!validationResult.success) {
+      const errorMessage = validationResult.error.errors.map((e: any) => e.message).join(', ');
+      return new Response(
+        JSON.stringify({ error: `Validation failed: ${errorMessage}` }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const { to, subject, content, fromName, fromEmail, letterContent } = validationResult.data;
+
+    // Sanitize string contents to prevent XSS/injection attacks inside HTML email rendering
+    const sanitizedFromName = fromName ? sanitizeInput(fromName) : '';
+    const sanitizedFromEmail = fromEmail ? sanitizeInput(fromEmail) : '';
+    const sanitizedSubject = sanitizeInput(subject);
+    const sanitizedPersonalMessage = content ? sanitizeHtml(content) : '';
+    
+    const sanitizedLetterContent = {
+      from: {
+        name: letterContent.from?.name ? sanitizeInput(letterContent.from.name) : '',
+        address: letterContent.from?.address ? sanitizeInput(letterContent.from.address) : '',
+      },
+      to: {
+        name: letterContent.to?.name ? sanitizeInput(letterContent.to.name) : '',
+        address: letterContent.to?.address ? sanitizeInput(letterContent.to.address) : '',
+      },
+      date: letterContent.date ? sanitizeInput(letterContent.date) : '',
+      subject: letterContent.subject ? sanitizeInput(letterContent.subject) : '',
+      content: letterContent.content ? sanitizeHtml(letterContent.content) : '',
+    };
 
     // Create a test SMTP transporter using Ethereal
     // For testing purposes, we'll create a test account
@@ -35,57 +172,67 @@ export async function POST(request: Request) {
     const formattedContent = `
       <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;">
         <div style="margin-bottom: 20px;">
-          ${fromName ? `<p style="margin-bottom: 5px;"><strong>${fromName}</strong></p>` : ''}
-          ${fromEmail ? `<p style="margin-bottom: 5px;">${fromEmail}</p>` : ''}
-          ${letterContent.from?.address ? `<p style="margin-bottom: 5px;">${letterContent.from.address}</p>` : ''}
+          ${sanitizedFromName ? `<p style="margin-bottom: 5px;"><strong>${sanitizedFromName}</strong></p>` : ''}
+          ${sanitizedFromEmail ? `<p style="margin-bottom: 5px;">${sanitizedFromEmail}</p>` : ''}
+          ${sanitizedLetterContent.from.address ? `<p style="margin-bottom: 5px;">${sanitizedLetterContent.from.address}</p>` : ''}
         </div>
         
         <div style="margin-bottom: 20px;">
-          <p>${letterContent.date || ''}</p>
+          <p>${sanitizedLetterContent.date || ''}</p>
         </div>
         
         <div style="margin-bottom: 20px;">
-          ${letterContent.to?.name ? `<p style="margin-bottom: 5px;"><strong>${letterContent.to.name}</strong></p>` : ''}
-          ${letterContent.to?.address ? `<p style="margin-bottom: 5px;">${letterContent.to.address}</p>` : ''}
+          ${sanitizedLetterContent.to.name ? `<p style="margin-bottom: 5px;"><strong>${sanitizedLetterContent.to.name}</strong></p>` : ''}
+          ${sanitizedLetterContent.to.address ? `<p style="margin-bottom: 5px;">${sanitizedLetterContent.to.address}</p>` : ''}
         </div>
         
-        ${letterContent.subject ? `<div style="margin-bottom: 20px;"><p><strong>Subject: ${letterContent.subject}</strong></p></div>` : ''}
+        ${sanitizedLetterContent.subject ? `<div style="margin-bottom: 20px;"><p><strong>Subject: ${sanitizedLetterContent.subject}</strong></p></div>` : ''}
         
         <div style="line-height: 1.6; white-space: pre-line;">
-          ${letterContent.content || ''}
+          ${sanitizedLetterContent.content || ''}
         </div>
       </div>
     `;
 
     // Additional personal message if provided
-    const personalMessage = content ? 
+    const personalMessageHtml = sanitizedPersonalMessage ? 
       `<div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
         <p><em>Personal message:</em></p>
-        <p>${content}</p>
+        <p>${sanitizedPersonalMessage}</p>
       </div>` : '';
 
     // Send email
     const info = await transporter.sendMail({
-      from: `"${fromName}" <${fromEmail || process.env.EMAIL_FROM || 'noreply@draftdeckai.com'}>`,
+      from: `"${sanitizedFromName}" <${sanitizedFromEmail || process.env.EMAIL_FROM || 'noreply@draftdeckai.com'}>`,
       to,
-      subject,
-      html: `${formattedContent}${personalMessage}`,
-      text: `${letterContent.content || ''}\n\n${content ? `Personal message: ${content}` : ''}`,
+      subject: sanitizedSubject,
+      html: `${formattedContent}${personalMessageHtml}`,
+      text: `${sanitizedLetterContent.content || ''}\n\n${sanitizedPersonalMessage ? `Personal message: ${sanitizedPersonalMessage}` : ''}`,
     });
 
     // Get the Ethereal URL for viewing the test email (only for Ethereal emails)
     const previewUrl = process.env.EMAIL_HOST ? null : nodemailer.getTestMessageUrl(info);
 
-    return NextResponse.json({
-      success: true,
-      messageId: info.messageId,
-      previewUrl
-    });
+    // Log successful email dispatch internally
+    logSecurityEvent('EMAIL_SENT_SUCCESSFULLY', { userId: user.id, messageId: info.messageId, to, ip }, ip);
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        messageId: info.messageId,
+        previewUrl
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
   } catch (error) {
+    // Safe error responses: Do not leak raw provider/server internals in API responses.
+    // Keep detailed errors only in server logs.
     console.error('Error sending email:', error);
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to send email' },
-      { status: 500 }
+    logSecurityEvent('EMAIL_SEND_ERROR', { error: error instanceof Error ? error.message : 'Unknown error', ip }, ip);
+    
+    return new Response(
+      JSON.stringify({ error: 'Failed to send email. Please try again later.' }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
     );
   }
 }
